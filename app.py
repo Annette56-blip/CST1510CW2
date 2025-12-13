@@ -238,10 +238,16 @@ with right:
     st.subheader(f"Preview: {table} ({len(df)} rows)")
     st.dataframe(df)
 
-    # If table includes severity → plot a quick distribution chart
-    if "severity" in df.columns:
-        st.subheader("Severity Distribution")
-        vc = df["severity"].fillna("UNKNOWN").value_counts()
-        fig, ax = plt.subplots()
-        vc.plot(kind="bar", ax=ax)
-        st.pyplot(fig)
+    # If table includes severity → plot a quick interactive distribution chart
+if "severity" in df.columns:
+    st.subheader("Severity Distribution (Interactive)")
+
+    vc = df["severity"].fillna("UNKNOWN").value_counts()
+
+    chart_df = pd.DataFrame({
+        "Severity": vc.index,
+        "Count": vc.values
+    })
+
+    st.bar_chart(chart_df, x="Severity", y="Count")
+

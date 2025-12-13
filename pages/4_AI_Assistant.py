@@ -4,123 +4,149 @@ import sqlite3
 from pathlib import Path
 import streamlit as st
 import pandas as pd
-import textwrap
 import numpy as np
-import datetime
+from datetime import datetime, timedelta
 
-# TRY TO ENABLE GOOGLE GENAI
+# ----------------------------
+# OPTIONAL GENAI SETUP
+# ----------------------------
 USE_GENAI = False
 try:
-    # Enable GenAI only if the environment variable is present
     if os.environ.get("GENAI_API_KEY"):
-        from google import genai  # Attempt import; failure sets USE_GENAI to False
+        from google import genai
         USE_GENAI = True
-except Exception:
-    # Any failure means the system falls back to offline local analysis
+except:
     USE_GENAI = False
 
 
-# DATABASE HELPERS
-# Path to the SQLite database that stores cyber incident records
+# ----------------------------
+# DATABASE LOADING
+# ----------------------------
 DB_PATH = Path(__file__).resolve().parents[1] / "db" / "data.db"
 
 def get_conn():
-    # Create a SQLite connection (thread-safe for Streamlit)
     return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-def get_incidents(limit=None) -> pd.DataFrame:
-    # Query the incidents table and optionally limit results
+    x
+def load_incidents():
     conn = get_conn()
-    q = "SELECT rowid AS id, * FROM cyber_incidents"
-    if limit:
-        q += f" LIMIT {int(limit)}"
-    df = pd.read_sql_query(q, conn)
-    conn.close()
+    df = pd.read_sql_query(
+        "SELECT * FROM cyber_incidents",
+        conn,
+        dtype={"incident_id": "string"}
+)
+
+
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+
     return df
 
+# local_analysis
 
-# LOCAL OFFLINE ANALYZER (NO LLM)
-def local_analyze_incident(row: pd.Series) -> str:
-    # Build a markdown-formatted analysis using heuristic rules
-    out = []
-    out.append(f"### Incident {row.get('id')} — {row.get('title')}")
-    out.append(f"- Severity: **{row.get('severity')}**")
-    out.append(f"- Status: {row.get('status')}")
-    out.append(f"- Reporter: {row.get('reporter')}")
-    out.append("")
+def local_analysis(question: str, df: pd.DataFrame):
+    q = question.lower().strip()
 
-    # Use notes or fallback to description if missing
-    notes = row.get("notes") or row.get("description") or "(no notes provided)"
-    text = (str(row.get('title')) + " " + notes).lower()
+    # 1 — PAST X DAYS DETECTION
+    if "past" in q and "days" in q:
+        numbers = [int(s) for s in q.split() if s.isdigit()]
+        num = numbers[0] if numbers else 2
 
-    out.append("#### Summary")
-    out.append(f"> {notes}")
+        cutoff = datetime.utcnow() - timedelta(days=num)
+        recent = df[df["timestamp"] >= cutoff]
 
-    # Simple keyword-based root cause estimation
-    rc = []
-    if "phish" in text: rc.append("Likely phishing or social engineering attack.")
-    if "malware" in text or "virus" in text: rc.append("Potential malware infection.")
-    if "scan" in text: rc.append("Reconnaissance / port scanning detected.")
-    if "password" in text: rc.append("Weak or compromised credentials involved.")
-    if not rc:
-        rc.append("Root cause unclear from available text; requires deeper investigation.")
+        if recent.empty:
+            return f"### No cyber attacks recorded in the past {num} day(s)."
 
-    out.append("#### Root Cause (Heuristic)")
-    for r in rc:
-        out.append(f"- {r}")
+        out = [f"### Cyber Attacks in the Past {num} Days ({len(recent)} found)"]
+        for _, r in recent.iterrows():
+            out.append(
+                f"- **{r['timestamp']}** | Severity: **{r['severity']}** | "
+                f"Category: **{r['category']}** | Description: {r.get('description', '(no description)')}"
+            )
 
-    # Immediate action recommendations based on severity
-    sev = str(row.get("severity")).lower()
-    out.append("#### Immediate Actions")
-    if "critical" in sev or "high" in sev:
-        out.extend([
-            "- Isolate affected system immediately.",
-            "- Collect forensic logs and system image.",
-            "- Reset credentials and enforce MFA.",
-            "- Activate incident response escalation."
-        ])
+        return "\n".join(out)
+
+    # 2 — KEYWORD SEARCH
+    keywords = ["phishing", "malware", "breach", "scan", "attack", "exploit"]
+
+    # Always determine searchable column
+    if "description" in df.columns:
+        text_col = "description"
+    elif "notes" in df.columns:
+        text_col = "notes"
     else:
-        out.extend([
-            "- Contain affected device.",
-            "- Review logs and recent activity.",
-            "- Change credentials if needed."
-        ])
+        text_col = None
 
-    # General long-term security recommendations
-    out.append("#### Long-term Prevention")
-    out.extend([
-        "- Improve user awareness training.",
-        "- Harden endpoint configurations.",
-        "- Enable better monitoring / alerting.",
-        "- Patch vulnerabilities and update software."
-    ])
+    for word in keywords:
+        if word in q:
+            # If no column to search, return empty immediately
+            if not text_col:
+                return f"### No searchable text column found to look for **{word}**."
 
-    # Basic risk assessment logic
-    out.append("#### Risk Assessment")
-    if "critical" in sev:
-        out.append("- High business impact likely.")
-    else:
-        out.append("- Impact appears moderate or low.")
+            hits = df[
+                df[text_col].astype(str).str.contains(word, case=False, na=False)
+            ]
 
-    # Extra reminders for investigation hygiene
-    out.append("#### Additional Notes")
-    out.append("- Consider reviewing related IOCs and network logs.")
-    out.append("- Ensure chain-of-custody for all evidence collected.")
+            if hits.empty:
+                return f"### No incidents found related to **{word}**."
 
-    return "\n\n".join(out)
+            out = [f"### Incidents related to '{word}' ({len(hits)} found)"]
+            for _, r in hits.iterrows():
+                out.append(
+                    f"- {r['timestamp']} | {r['severity']} | {r.get(text_col, '(no details)')}"
+                )
 
-# OPTIONAL GENAI STREAMING LLM CALL
-def stream_genai(prompt_text: str):
-    """Yields partial LLM responses. Silent fallback handled by caller."""
-    # Create GenAI client and stream the model response incrementally
-    client = genai.Client(api_key=os.environ.get("GENAI_API_KEY"))
+            return "\n".join(out)
+
+    # 3 — FALLBACK
+    return f"""
+### I understood your question as:
+
+> **{question}**
+
+But I need more detail.  
+Try something like:
+
+- “show all attacks in the past 3 days”
+- “find phishing incidents”
+- “list high severity incidents”
+"""
+
+
+
+# ----------------------------
+# GENAI CLOUD ANALYSIS
+# ----------------------------
+def genai_answer(question: str, df: pd.DataFrame):
+    client = genai.Client(api_key=os.environ["GENAI_API_KEY"])
+
+    prompt = f"""
+You are a cybersecurity analyst. Use the dataset below to answer:
+
+QUESTION:
+{question}
+
+DATA SAMPLE:
+{df.head(15).to_dict()}
+
+Give:
+- direct answer
+- list of matching incidents
+- severity interpretation
+- risk implications
+- recommendations
+"""
+
+    ### >>> CHANGE MODEL HERE <<<
+    model_name = "gemini-2.0-flash"
+
     stream = client.models.generate_content_stream(
-        model="gemini-1.0-pro",
-        contents=prompt_text
+        model=model_name,
+        contents=prompt
     )
 
     full = ""
-    # Yield each chunk as it arrives so UI can update live
     for chunk in stream:
         text = getattr(chunk, "text", "")
         if text:
@@ -128,71 +154,37 @@ def stream_genai(prompt_text: str):
             yield full
 
 
-# UI
-# Configure Streamlit layout
-st.set_page_config(page_title="AI Incident Analyzer", layout="wide")
-st.title("🚨 AI Incident Analyzer")
+# ----------------------------
+# STREAMLIT UI
+# ----------------------------
+st.set_page_config(page_title="AI Assistant", layout="wide")
+st.title("🤖 AI Cyber Incident Assistant")
 
-# Ensure user is logged in before accessing the tool
 if not st.session_state.get("logged_in", False):
-    st.info("Log in to access this tool.")
+    st.warning("Please log in to use the assistant.")
     st.stop()
 
-# Load incidents
-df = get_incidents(limit=500)
-if df.empty:
-    st.warning("No incidents found in database.")
-    st.stop()
+df = load_incidents()
 
-# Build selection labels (ID + title + severity)
-labels = [f"{int(r['id'])}: {r.get('title')} — {r.get('severity')}" for _, r in df.iterrows()]
-choice = st.selectbox("Select an incident", labels)
+st.write("### Ask any question about cyber attacks:")
+question = st.text_input("Example: Show attacks in the past 2 days")
 
-# Extract selected incident ID from label
-selected_id = int(choice.split(":")[0])
-row = df[df["id"] == selected_id].iloc[0]
+if st.button("Analyze"):
+    if not question.strip():
+        st.warning("Type something first.")
+        st.stop()
 
-# Display incident metadata
-st.subheader("Incident Details")
-st.write("**Title:**", row["title"])
-st.write("**Severity:**", row["severity"])
-st.write("**Status:**", row["status"])
-st.write("**Reporter:**", row["reporter"])
-st.write("**Notes:**")
-st.write(row.get("notes") or row.get("description") or "(none)")
-
-st.markdown("---")
-
-# Display whether GenAI or the local analyzer will be used
-mode = "GenAI" if USE_GENAI else "Local"
-st.write(f"Analyzer mode: **{mode}**")
-
-# Run analysis when button is clicked
-if st.button("Analyze with AI"):
-    with st.spinner("Analyzing incident..."):
-
-        # Construct prompt for GenAI or fallback
-        prompt = textwrap.dedent(f"""
-        You are a senior cybersecurity analyst. Produce a structured analysis.
-        Include: root cause, immediate actions, long-term prevention,
-        risk assessment, evidence checklist, and executive summary.
-
-        INCIDENT DATA:
-        {row.to_dict()}
-        """)
+    with st.spinner("Analyzing..."):
 
         if USE_GENAI:
             try:
-                # Stream partial LLM responses to UI
                 container = st.empty()
-                for partial in stream_genai(prompt):
+                for partial in genai_answer(question, df):
                     container.markdown(partial)
-            except Exception:
-                # Fail silently and use offline analyzer
-                st.markdown(local_analyze_incident(row))
+            except Exception as e:
+                st.error("Cloud AI failed. Using offline mode.")
+                st.markdown(local_analysis(question, df))
         else:
-            # Offline deterministic analysis
-            st.markdown(local_analyze_incident(row))
+            st.markdown(local_analysis(question, df))
 
-# Footer info about LLM usage
-st.caption("Cloud LLM is used only if GENAI_API_KEY is set. Otherwise the offline local analyzer is used.")
+st.caption("Cloud LLM used ONLY if GENAI_API_KEY is set. Otherwise offline mode is used.")

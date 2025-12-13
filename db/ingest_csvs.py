@@ -2,37 +2,62 @@ import sqlite3
 from pathlib import Path
 import pandas as pd
 
-# Resolve project root folder and define paths to data and database
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "DATA"            # Folder containing CSV files
-DB_PATH = ROOT / "db" / "data.db"   # SQLite database file
+DATA_DIR = ROOT / "DATA"
+DB_PATH = ROOT / "db" / "data.db"
 
 def ingest():
-    # Open a connection to the SQLite database
     conn = sqlite3.connect(DB_PATH)
     print(f"Using DB: {DB_PATH}")
 
-    # Loop through every CSV file in the DATA directory
-    for csv_file in DATA_DIR.glob("*.csv"):
-        print(f"\nReading {csv_file.name}")
+    # ---------------- CYBER INCIDENTS ----------------
+    cyber = pd.read_csv(DATA_DIR / "cyber_incidents.csv")
 
-        # Load the CSV into a DataFrame
-        df = pd.read_csv(csv_file)
+    cyber = cyber.rename(columns={
+        "incident_id": "incident_id",
+        "timestamp": "timestamp",
+        "severity": "severity",
+        "category": "category",
+        "status": "status",
+        "description": "notes"
+    })
 
-        # Use the CSV filename (without extension) as table name
-        # Replace '-' with '_' to keep it SQL-friendly
-        table = csv_file.stem.replace("-", "_")
+    cyber.to_sql("cyber_incidents", conn, if_exists="replace", index=False)
+    print("Imported: cyber_incidents")
 
-        print(df.head())  # Preview first few rows for sanity check
+    # ---------------- IT TICKETS ----------------
+    it = pd.read_csv(DATA_DIR / "it_tickets.csv")
 
-        # Write DataFrame to SQLite table (overwrite if it already exists)
-        df.to_sql(table, conn, if_exists="replace", index=False)
-        print(f"Imported → {table}")
+    it = it.rename(columns={
+        "ticket_id": "ticket_id",
+        "priority": "priority",
+        "description": "description",
+        "status": "status",
+        "assigned_to": "assignee",
+        "created_at": "created_at",
+        "resolution_time_hours": "resolution_time_hours"
+    })
 
-    # Close the database connection once all files are processed
+    it.to_sql("it_tickets", conn, if_exists="replace", index=False)
+    print("Imported: it_tickets")
+
+    # ---------------- DATASETS METADATA ----------------
+    meta = pd.read_csv(DATA_DIR / "datasets_metadata.csv")
+
+    meta = meta.rename(columns={
+        "dataset_id": "dataset_id",
+        "name": "name",
+        "rows": "rows",
+        "columns": "columns",
+        "uploaded_by": "uploaded_by",
+        "upload_date": "uploaded_at"
+    })
+
+    meta.to_sql("datasets_metadata", conn, if_exists="replace", index=False)
+    print("Imported: datasets_metadata")
+
     conn.close()
-    print("\nDONE — all CSVs imported successfully.")
+    print("\nDONE — database successfully refreshed!")
 
 if __name__ == "__main__":
-    # Entry point to run ingestion when script is executed directly
     ingest()
