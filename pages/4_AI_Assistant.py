@@ -2,10 +2,10 @@
 import os
 import sqlite3
 from pathlib import Path
+from datetime import datetime, timedelta
+
 import streamlit as st
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
 
 # ----------------------------
 # OPTIONAL GENAI SETUP
@@ -14,8 +14,9 @@ USE_GENAI = False
 try:
     if os.environ.get("GENAI_API_KEY"):
         from google import genai
+        from google.genai import types
         USE_GENAI = True
-except:
+except Exception:
     USE_GENAI = False
 
 
@@ -26,15 +27,15 @@ DB_PATH = Path(__file__).resolve().parents[1] / "db" / "data.db"
 
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
-    x
+
 def load_incidents():
     conn = get_conn()
     df = pd.read_sql_query(
         "SELECT * FROM cyber_incidents",
         conn,
         dtype={"incident_id": "string"}
-)
-
+    )
+    conn.close()
 
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -42,120 +43,61 @@ def load_incidents():
 
     return df
 
-# local_analysis
 
-def local_analysis(question: str, df: pd.DataFrame):
+# ----------------------------
+# LOCAL (OFFLINE) ANALYSIS
+# ----------------------------
+def local_analysis(question: str, df: pd.DataFrame) -> str:
     q = question.lower().strip()
 
-    # 1 — PAST X DAYS DETECTION
+    # Past X days
     if "past" in q and "days" in q:
         numbers = [int(s) for s in q.split() if s.isdigit()]
-        num = numbers[0] if numbers else 2
+        days = numbers[0] if numbers else 2
 
-        cutoff = datetime.utcnow() - timedelta(days=num)
+        cutoff = datetime.utcnow() - timedelta(days=days)
         recent = df[df["timestamp"] >= cutoff]
 
         if recent.empty:
-            return f"### No cyber attacks recorded in the past {num} day(s)."
+            return f"No cyber incidents recorded in the past {days} days."
 
-        out = [f"### Cyber Attacks in the Past {num} Days ({len(recent)} found)"]
+        lines = [f"### Cyber Incidents in the Past {days} Days ({len(recent)} found)"]
         for _, r in recent.iterrows():
-            out.append(
-                f"- **{r['timestamp']}** | Severity: **{r['severity']}** | "
-                f"Category: **{r['category']}** | Description: {r.get('description', '(no description)')}"
+            lines.append(
+                f"- **{r['timestamp']}** | "
+                f"Severity: **{r.get('severity','N/A')}** | "
+                f"Category: **{r.get('category','N/A')}**"
             )
 
-        return "\n".join(out)
+        return "\n".join(lines)
 
-    # 2 — KEYWORD SEARCH
-    keywords = ["phishing", "malware", "breach", "scan", "attack", "exploit"]
+    # Keyword search
+    text_col = None
+    for col in ["description", "notes"]:
+        if col in df.columns:
+            text_col = col
+            break
 
-    # Always determine searchable column
-    if "description" in df.columns:
-        text_col = "description"
-    elif "notes" in df.columns:
-        text_col = "notes"
-    else:
-        text_col = None
+    if text_col:
+        keywords = ["phishing", "malware", "breach", "scan", "attack", "exploit"]
+        for word in keywords:
+            if word in q:
+                hits = df[df[text_col].astype(str).str.contains(word, case=False, na=False)]
+                if hits.empty:
+                    return f"No incidents found related to **{word}**."
+                return f"Found **{len(hits)}** incidents related to **{word}**."
 
-    for word in keywords:
-        if word in q:
-            # If no column to search, return empty immediately
-            if not text_col:
-                return f"### No searchable text column found to look for **{word}**."
-
-            hits = df[
-                df[text_col].astype(str).str.contains(word, case=False, na=False)
-            ]
-
-            if hits.empty:
-                return f"### No incidents found related to **{word}**."
-
-            out = [f"### Incidents related to '{word}' ({len(hits)} found)"]
-            for _, r in hits.iterrows():
-                out.append(
-                    f"- {r['timestamp']} | {r['severity']} | {r.get(text_col, '(no details)')}"
-                )
-
-            return "\n".join(out)
-
-    # 3 — FALLBACK
-    return f"""
-### I understood your question as:
-
-> **{question}**
-
-But I need more detail.  
-Try something like:
-
-- “show all attacks in the past 3 days”
-- “find phishing incidents”
-- “list high severity incidents”
-"""
-
-
-
-# ----------------------------
-# GENAI CLOUD ANALYSIS
-# ----------------------------
-def genai_answer(question: str, df: pd.DataFrame):
-    client = genai.Client(api_key=os.environ["GENAI_API_KEY"])
-
-    prompt = f"""
-You are a cybersecurity analyst. Use the dataset below to answer:
-
-QUESTION:
-{question}
-
-DATA SAMPLE:
-{df.head(15).to_dict()}
-
-Give:
-- direct answer
-- list of matching incidents
-- severity interpretation
-- risk implications
-- recommendations
-"""
-
-    ### >>> CHANGE MODEL HERE <<<
-    model_name = "gemini-2.0-flash"
-
-    stream = client.models.generate_content_stream(
-        model=model_name,
-        contents=prompt
+    return (
+        "I couldn’t confidently answer that.\n\n"
+        "Try questions like:\n"
+        "- *Show attacks in the past 3 days*\n"
+        "- *Find phishing incidents*\n"
+        "- *List high severity attacks*"
     )
 
-    full = ""
-    for chunk in stream:
-        text = getattr(chunk, "text", "")
-        if text:
-            full += text
-            yield full
-
 
 # ----------------------------
-# STREAMLIT UI
+# STREAMLIT UI (CHAT MODE)
 # ----------------------------
 st.set_page_config(page_title="AI Assistant", layout="wide")
 st.title("🤖 AI Cyber Incident Assistant")
@@ -166,25 +108,69 @@ if not st.session_state.get("logged_in", False):
 
 df = load_incidents()
 
-st.write("### Ask any question about cyber attacks:")
-question = st.text_input("Example: Show attacks in the past 2 days")
+# Initialize chat history
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-if st.button("Analyze"):
-    if not question.strip():
-        st.warning("Type something first.")
-        st.stop()
+# Display chat history
+for msg in st.session_state.messages:
+    role = "assistant" if msg["role"] == "model" else msg["role"]
+    with st.chat_message(role):
+        st.markdown(msg["content"])
 
-    with st.spinner("Analyzing..."):
+# Chat input
+user_question = st.chat_input("Ask a question about cyber incidents...")
 
-        if USE_GENAI:
-            try:
-                container = st.empty()
-                for partial in genai_answer(question, df):
-                    container.markdown(partial)
-            except Exception as e:
-                st.error("Cloud AI failed. Using offline mode.")
-                st.markdown(local_analysis(question, df))
-        else:
-            st.markdown(local_analysis(question, df))
+if user_question:
+    # Save user message
+    st.session_state.messages.append({
+        "role": "user",
+        "content": user_question
+    })
 
-st.caption("Cloud LLM used ONLY if GENAI_API_KEY is set. Otherwise offline mode is used.")
+    with st.chat_message("user"):
+        st.markdown(user_question)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Analyzing..."):
+
+            # ---------- CLOUD GENAI ----------
+            if USE_GENAI:
+                try:
+                    client = genai.Client(api_key=os.environ["GENAI_API_KEY"])
+
+                    prompt = f"""
+You are a cybersecurity analyst.
+
+QUESTION:
+{user_question}
+
+DATA SAMPLE:
+{df.head(20).to_dict()}
+
+Respond clearly, using the dataset where relevant.
+"""
+
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt
+                    )
+
+                    answer = response.text
+
+                except Exception:
+                    answer = local_analysis(user_question, df)
+
+            # ---------- OFFLINE ----------
+            else:
+                answer = local_analysis(user_question, df)
+
+            st.markdown(answer)
+
+            # Save assistant reply
+            st.session_state.messages.append({
+                "role": "model",
+                "content": answer
+            })
+
+st.caption("Cloud AI is used only if GENAI_API_KEY is configured. Otherwise offline analysis is applied.")
